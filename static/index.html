@@ -120,7 +120,7 @@ async function lessons() {
   const list = await api("/bookings"), mgr = me.role !== "teacher";
   main.innerHTML = list.length ? list.map(b => `<div class="card"><b>${when(b.start)}</b><br>Ученик: ${esc(b.student)}
     ${mgr ? `<br>Преподаватель: ${esc(b.teacher)}` : ""}${b.note ? `<br><span class="hint">${esc(b.note)}</span>` : ""}
-    ${mgr ? `<div class="hint">${b.confirmed ? "Преподаватель подтвердил" : "Ждём подтверждения преподавателя"}</div>
+    ${mgr ? `<div class="hint">${b.confirmed ? "Преподаватель подтвердил" : "Ждем подтверждения преподавателя"}</div>
     <div class="row"><button class="btn" ${b.synced ? "disabled" : ""} data-a="sync" data-i="${b.id}">${b.synced ? "Внесено в langlisto" : "Внесено в langlisto?"}</button>
     <button class="btn2" data-a="move" data-i="${b.id}" data-t="${b.teacher_id}">Перенести</button>
     <button class="btn2" data-a="cancel" data-i="${b.id}">Отменить</button></div>` : ""}</div>`).join("")
