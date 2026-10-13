@@ -24,7 +24,7 @@ bot, dp = Bot(TOKEN), Dispatcher()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(tg_id INTEGER PRIMARY KEY, name TEXT NOT NULL,
-  role TEXT NOT NULL CHECK(role IN ('teacher','manager','admin')));
+  role TEXT NOT NULL CHECK(role IN ('teacher','manager','admin')), timezone TEXT NOT NULL DEFAULT 'Europe/Moscow');
 CREATE TABLE IF NOT EXISTS availability(teacher_id INTEGER, weekday INTEGER, hour INTEGER,
   PRIMARY KEY(teacher_id, weekday, hour));
 CREATE TABLE IF NOT EXISTS days_off(teacher_id INTEGER, day TEXT, PRIMARY KEY(teacher_id, day));
@@ -32,8 +32,13 @@ CREATE TABLE IF NOT EXISTS blocks(teacher_id INTEGER, day TEXT, hour INTEGER, PR
 CREATE TABLE IF NOT EXISTS bookings(id INTEGER PRIMARY KEY AUTOINCREMENT, teacher_id INTEGER NOT NULL,
   start TEXT NOT NULL, student TEXT NOT NULL, note TEXT DEFAULT '', created_by INTEGER,
   status TEXT DEFAULT 'active', confirmed INTEGER DEFAULT 0, synced INTEGER DEFAULT 0,
-  reminded INTEGER DEFAULT 0, changed_at TEXT NOT NULL);
+  reminded INTEGER DEFAULT 0, changed_at TEXT NOT NULL, recurrence_id TEXT DEFAULT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS one_lesson_per_slot ON bookings(teacher_id, start) WHERE status='active';
+CREATE TABLE IF NOT EXISTS recurring_series(id TEXT PRIMARY KEY, teacher_id INTEGER NOT NULL,
+  student TEXT NOT NULL, note TEXT DEFAULT '', weekdays TEXT NOT NULL, hour INTEGER NOT NULL,
+  start_day TEXT NOT NULL, weeks INTEGER NOT NULL, created_by INTEGER NOT NULL, active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS sent_weekly_reminders(day TEXT NOT NULL, teacher_id INTEGER NOT NULL,
+  PRIMARY KEY(day, teacher_id));
 """
 
 
@@ -41,6 +46,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_lesson_per_slot ON bookings(teacher_id, st
 def init_db():
     with closing(sqlite3.connect(DB)) as c:
         c.executescript(SCHEMA)
+        # Безопасные миграции существующей базы: старые записи и пользователи сохраняются.
+        user_cols = {r[1] for r in c.execute("PRAGMA table_info(users)")}
+        if "timezone" not in user_cols:
+            c.execute("ALTER TABLE users ADD COLUMN timezone TEXT NOT NULL DEFAULT 'Europe/Moscow'")
+        booking_cols = {r[1] for r in c.execute("PRAGMA table_info(bookings)")}
+        if "recurrence_id" not in booking_cols:
+            c.execute("ALTER TABLE bookings ADD COLUMN recurrence_id TEXT DEFAULT NULL")
 
 
 def q(sql, args=()):
@@ -62,7 +74,21 @@ def run(sql, args=()):
 
 
 def now_utc():
-    return datetime.utcnow().isoformat()
+    return datetime.now(ZoneInfo("UTC")).replace(tzinfo=None).isoformat()
+
+
+def local_start(start):
+    """Перевод времени расписания (Europe/Moscow) в UTC для точного отображения у преподавателя."""
+    d = datetime.fromisoformat(start)
+    return d.replace(tzinfo=TZ).astimezone(ZoneInfo("UTC")).isoformat()
+
+
+def teacher_local(start, timezone):
+    try:
+        d = datetime.fromisoformat(local_start(start)).replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(timezone))
+        return f"{WD[d.weekday()]} {d:%d.%m %H:%M}"
+    except Exception:
+        return fmt(start)
 
 
 def today():
@@ -113,7 +139,7 @@ def user(x_init_data: str = Header("")):
     uid = tg_id(x_init_data)
     rows = q("SELECT * FROM users WHERE tg_id=?", (uid,))
     if not rows and uid in ADMINS:
-        run("INSERT INTO users VALUES(?,?,?)", (uid, "Админ", "admin"))
+        run("INSERT INTO users(tg_id,name,role) VALUES(?,?,?)", (uid, "Админ", "admin"))
         rows = q("SELECT * FROM users WHERE tg_id=?", (uid,))
     if not rows:
         raise HTTPException(403, f"Нет доступа. Передайте администратору ваш Telegram ID: {uid}")
@@ -168,7 +194,7 @@ async def cmd_add(m: Message, command: CommandObject):
     try:
         uid, role, name = command.args.split(maxsplit=2)
         assert role in ("teacher", "manager")
-        run("INSERT OR REPLACE INTO users VALUES(?,?,?)", (int(uid), name, role))
+        run("INSERT OR REPLACE INTO users(tg_id,name,role) VALUES(?,?,?)", (int(uid), name, role))
     except Exception:
         return await m.answer("Формат: /add <telegram_id> <teacher|manager> <имя>")
     await m.answer(f"Добавлено: {name} ({role})")
@@ -186,16 +212,26 @@ async def on_ok(c: CallbackQuery):
 
 
 async def reminders():
+    """Напоминания менеджерам о langlisto и преподавателям по пятницам в 12:00 МСК."""
     while True:
-        await asyncio.sleep(300)
         try:
-            cutoff = (datetime.utcnow() - timedelta(minutes=REMIND_AFTER_MIN)).isoformat()
+            cutoff = (datetime.now(ZoneInfo("UTC")).replace(tzinfo=None) - timedelta(minutes=REMIND_AFTER_MIN)).isoformat()
             for b in q("SELECT b.*, u.name tname FROM bookings b JOIN users u ON u.tg_id=b.teacher_id "
                        "WHERE status='active' AND synced=0 AND reminded=0 AND changed_at<?", (cutoff,)):
                 await notify_managers(f"Внесите в langlisto: {fmt(b['start'])}, {b['tname']}, ученик {b['student']}")
                 run("UPDATE bookings SET reminded=1 WHERE id=?", (b["id"],))
+
+            now = datetime.now(TZ)
+            if now.weekday() == 4 and now.hour >= 12:
+                day_key = now.date().isoformat()
+                for t in q("SELECT tg_id, name FROM users WHERE role='teacher'"):
+                    if not q("SELECT 1 FROM sent_weekly_reminders WHERE day=? AND teacher_id=?", (day_key, t["tg_id"])):
+                        await notify(t["tg_id"], "Добрый день! Пожалуйста, актуализируйте расписание на следующую неделю в The Teachers. Если ваши окна не изменились, откройте приложение и проверьте, что расписание актуально.",
+                                     InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть расписание", web_app=WebAppInfo(url=BASE_URL))]]))
+                        run("INSERT OR IGNORE INTO sent_weekly_reminders(day, teacher_id) VALUES(?,?)", (day_key, t["tg_id"]))
         except Exception:
             pass
+        await asyncio.sleep(30)
 
 
 # ---------- API ----------
@@ -218,6 +254,20 @@ class MoveIn(BaseModel):
     start: str
 
 
+class TimezoneIn(BaseModel):
+    timezone: str
+
+
+class RecurringBookingIn(BaseModel):
+    teacher_id: int
+    student: str
+    note: str = ""
+    weekdays: list[int]
+    hour: int
+    start_day: str
+    weeks: int = 8
+
+
 @asynccontextmanager
 async def lifespan(app):
     init_db()
@@ -233,12 +283,27 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(os.path.dirname(__file__), "static", "index.html"))
+    # В загруженном архиве index.html лежит в корне репозитория.
+    path = os.path.join(os.path.dirname(__file__), "static", "index.html")
+    if not os.path.isfile(path):
+        path = os.path.join(os.path.dirname(__file__), "index.html")
+    return FileResponse(path)
 
 
 @app.get("/api/me")
 def me(u=Depends(user)):
-    return u
+    return {**u, "moscow_now": datetime.now(TZ).strftime("%Y-%m-%dT%H:%M"),
+            "teacher_local_now": datetime.now(ZoneInfo(u.get("timezone") or "Europe/Moscow")).strftime("%Y-%m-%dT%H:%M")}
+
+
+@app.put("/api/timezone")
+def put_timezone(b: TimezoneIn, u=Depends(teacher)):
+    try:
+        ZoneInfo(b.timezone)
+    except Exception:
+        raise HTTPException(422, "Выберите корректный часовой пояс")
+    run("UPDATE users SET timezone=? WHERE tg_id=?", (b.timezone, u["tg_id"]))
+    return {"ok": True, "timezone": b.timezone}
 
 
 @app.get("/api/availability")
@@ -246,7 +311,8 @@ def get_availability(u=Depends(teacher)):
     t = u["tg_id"]
     return {"slots": [[r["weekday"], r["hour"]] for r in q("SELECT weekday,hour FROM availability WHERE teacher_id=?", (t,))],
             "days_off": [r["day"] for r in q("SELECT day FROM days_off WHERE teacher_id=? AND day>=? ORDER BY day", (t, today()))],
-            "blocks": q("SELECT day, hour FROM blocks WHERE teacher_id=? AND day>=? ORDER BY day, hour", (t, today()))}
+            "blocks": q("SELECT day, hour FROM blocks WHERE teacher_id=? AND day>=? ORDER BY day, hour", (t, today())),
+            "timezone": u.get("timezone") or "Europe/Moscow"}
 
 
 @app.put("/api/availability")
@@ -314,8 +380,16 @@ def bookings(u=Depends(user)):
     sql = ("SELECT b.*, t.name teacher FROM bookings b JOIN users t ON t.tg_id=b.teacher_id "
            "WHERE b.status='active' AND b.start>=?")
     if u["role"] == "teacher":
-        return q(sql + " AND b.teacher_id=? ORDER BY b.start", (now, u["tg_id"]))
-    return q(sql + " ORDER BY b.start", (now,))
+        rows = q(sql + " AND b.teacher_id=? ORDER BY b.start", (now, u["tg_id"]))
+    else:
+        rows = q(sql + " ORDER BY b.start", (now,))
+    for r in rows:
+        r["start_utc"] = local_start(r["start"])
+        if u["role"] == "teacher":
+            r["local_start"] = teacher_local(r["start"], u.get("timezone") or "Europe/Moscow")
+        else:
+            r["local_start"] = None
+    return rows
 
 
 def get_booking(bid):
@@ -358,6 +432,47 @@ async def cancel_booking(bid: int, u=Depends(manager)):
     run("UPDATE bookings SET status='cancelled' WHERE id=?", (bid,))
     await notify(old["teacher_id"], f"Урок отменён: {fmt(old['start'])}\nУченик: {old['student']}")
     return {"ok": True}
+
+
+@app.post("/api/recurring-bookings")
+async def create_recurring_bookings(b: RecurringBookingIn, u=Depends(manager)):
+    if not b.student.strip():
+        raise HTTPException(422, "Укажите ученика")
+    if not b.weekdays or any(w < 0 or w > 6 for w in b.weekdays):
+        raise HTTPException(422, "Выберите дни недели")
+    if not 8 <= b.hour <= 21:
+        raise HTTPException(422, "Время должно быть в диапазоне 08:00–21:00")
+    if not 1 <= b.weeks <= 16:
+        raise HTTPException(422, "Можно создать расписание на 1–16 недель")
+    start_day = date.fromisoformat(b.start_day)
+    if start_day < datetime.now(TZ).date():
+        raise HTTPException(422, "Дата начала не может быть в прошлом")
+    series_id = hashlib.sha256(f"{time.time_ns()}:{u['tg_id']}:{b.teacher_id}".encode()).hexdigest()[:16]
+    teacher_rows = q("SELECT tg_id, name FROM users WHERE tg_id=? AND role='teacher'", (b.teacher_id,))
+    if not teacher_rows:
+        raise HTTPException(404, "Преподаватель не найден")
+    run("INSERT INTO recurring_series(id, teacher_id, student, note, weekdays, hour, start_day, weeks, created_by) VALUES(?,?,?,?,?,?,?,?,?)",
+        (series_id, b.teacher_id, b.student.strip(), b.note.strip(), json.dumps(sorted(set(b.weekdays))), b.hour, start_day.isoformat(), b.weeks, u["tg_id"]))
+    created, conflicts = [], []
+    for week in range(b.weeks):
+        for weekday in sorted(set(b.weekdays)):
+            day = start_day + timedelta(days=(weekday - start_day.weekday()) % 7 + week * 7)
+            # Если стартовая дата уже попадает на выбранный день, он считается первой неделей.
+            if day < start_day:
+                continue
+            start = f"{day.isoformat()}T{b.hour:02d}:00"
+            if b.hour not in free_hours(b.teacher_id, day):
+                conflicts.append({"start": start, "reason": "Слот недоступен или уже занят"})
+                continue
+            try:
+                bid = run("INSERT INTO bookings(teacher_id,start,student,note,created_by,changed_at,recurrence_id) VALUES(?,?,?,?,?,?,?)",
+                          (b.teacher_id, start, b.student.strip(), b.note.strip(), u["tg_id"], now_utc(), series_id))
+                created.append({"id": bid, "start": start})
+            except sqlite3.IntegrityError:
+                conflicts.append({"start": start, "reason": "Слот уже занят"})
+    if created:
+        await notify(b.teacher_id, f"Добавлено регулярное расписание для ученика {b.student.strip()}: {len(created)} занятий. Первое занятие: {fmt(min(created, key=lambda x: x['start'])['start'])}. Проверьте расписание в приложении.")
+    return {"series_id": series_id, "created": created, "conflicts": conflicts}
 
 
 @app.post("/api/bookings/{bid}/synced")
