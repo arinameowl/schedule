@@ -42,7 +42,7 @@ const tg = Telegram.WebApp; tg.ready(); tg.expand();
 const $ = s => document.querySelector(s), main = $("main"), nav = $("nav"), dlg = $("#dlg");
 const WD = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"], HOURS = [...Array(15)].map((_, i) => i + 8);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-const today = () => new Date().toLocaleDateString("sv");
+const today = () => new Date().toLocaleDateString("sv", {timeZone:"Europe/Moscow"});
 const hh = h => String(h).padStart(2, "0") + ":00";
 const when = s => WD[(new Date(s.slice(0,10) + "T12:00").getDay() + 6) % 7] + " " + s.slice(8,10) + "." + s.slice(5,7) + " " + s.slice(11,16);
 const toast = m => tg.showAlert(m);
@@ -83,10 +83,14 @@ function dayRange(w) {
 
 async function windows() {
   const a = await api("/availability"), on = draft || new Set(a.slots.map(s => s.join(":")));
+  const upcoming = await api("/bookings");
   const byDay = {}; a.blocks.forEach(b => (byDay[b.day] ||= []).push(b.hour));
   const again = () => { draft = gridSet(); windows(); };
   const del = (attrs, label) => `<div class="card row">${label}<button class="btn2" style="margin:0 0 0 auto" ${attrs}>Убрать</button></div>`;
-  main.innerHTML = `<p class="hint">Нажмите на день недели, чтобы задать часы диапазоном (например, 13:00–19:00), или отметьте часы вручную. Они повторяются каждую неделю.</p>
+  main.innerHTML = `<p class="hint">Основное расписание ведется по Москве (МСК). Ваше локальное время: <b id="localnow">загрузка…</b>. Время в сетке ниже указано по Москве.</p>
+  <h3>Ваш часовой пояс</h3><input id="timezone" list="tzlist" placeholder="Например, Europe/Amsterdam"><datalist id="tzlist"><option value="Europe/Moscow">Москва</option><option value="Europe/Kaliningrad">Калининград</option><option value="Europe/Istanbul">Стамбул</option><option value="Europe/Berlin">Берлин</option><option value="Europe/Amsterdam">Амстердам</option><option value="Europe/Paris">Париж</option><option value="Europe/Stockholm">Стокгольм</option><option value="Europe/Helsinki">Хельсинки</option><option value="Europe/London">Лондон</option><option value="Asia/Almaty">Алматы</option><option value="Asia/Tbilisi">Тбилиси</option><option value="Asia/Dubai">Дубай</option><option value="Asia/Bangkok">Бангкок</option><option value="Asia/Tokyo">Токио</option><option value="Asia/Novosibirsk">Новосибирск</option><option value="Asia/Yekaterinburg">Екатеринбург</option><option value="UTC">UTC</option><option value="America/New_York">Нью-Йорк</option><option value="America/Los_Angeles">Лос-Анджелес</option></datalist>
+  <button class="btn2" id="savetz">Сохранить часовой пояс</button>
+  <p class="hint">Нажмите на день недели, чтобы задать часы диапазоном (например, 13:00–19:00), или отметьте часы вручную. Они повторяются каждую неделю.</p>
   <table><tr><th></th>${WD.map((d, w) => `<th><button class="d" data-w="${w}">${d}</button></th>`).join("")}</tr>
   ${HOURS.map(h => `<tr><th>${h}</th>${WD.map((_, w) => `<td><button class="c${on.has(w + ":" + h) ? " on" : ""}" data-k="${w}:${h}"></button></td>`).join("")}</tr>`).join("")}</table>
   <button class="btn" id="save">Сохранить окна</button>
@@ -95,7 +99,13 @@ async function windows() {
   <div class="row"><select id="bf" style="flex:1">${opts(8, 22, 10)}</select><select id="bt" style="flex:1">${opts(9, 23, 12)}</select></div>
   <div class="row"><button class="btn" id="addblk">Закрыть часы</button><button class="btn2" id="addoff">Закрыть весь день</button></div>
   <div style="margin-top:12px">${a.days_off.map(d => del(`data-d="${d}"`, `${d}, весь день`)).join("")}
-  ${Object.entries(byDay).flatMap(([d, hs]) => rng(hs).map(([f, t]) => del(`data-bd="${d}" data-bf="${f}" data-bt="${t}"`, `${d}, ${hh(f)}–${hh(t)}`))).join("")}</div>`;
+  ${Object.entries(byDay).flatMap(([d, hs]) => rng(hs).map(([f, t]) => del(`data-bd="${d}" data-bf="${f}" data-bt="${t}"`, `${d}, ${hh(f)}–${hh(t)}`))).join("")}</div>
+  <h3>Занятые окна — ближайшие уроки</h3>
+  <p class="hint">Эти часы уже заняты и не доступны для новой записи. Время указано по Москве и в вашем часовом поясе.</p>
+  <div>${upcoming.length ? upcoming.slice(0,30).map(b => `<div class="card"><b>${when(b.start)} МСК</b><br>${esc(b.student)}<br><span class="hint">Ваше время: ${esc(b.local_start || when(b.start))}</span></div>`).join("") : `<p class="hint">Ближайших уроков пока нет.</p>`}</div>`;
+  $("#timezone").value = a.timezone || "Europe/Moscow";
+  try { $("#localnow").textContent = new Intl.DateTimeFormat("ru-RU", {timeZone:a.timezone || "Europe/Moscow", dateStyle:"short", timeStyle:"short"}).format(new Date()); } catch {}
+  $("#savetz").onclick = safe(async () => { await api("/timezone", "PUT", {timezone:$("#timezone").value}); ok(); toast("Часовой пояс сохранен"); windows(); });
   main.querySelectorAll(".c").forEach(b => b.onclick = () => b.classList.toggle("on"));
   main.querySelectorAll(".d").forEach(b => b.onclick = () => dayRange(+b.dataset.w));
   $("#save").onclick = safe(async () => {
@@ -118,19 +128,39 @@ async function windows() {
 
 async function lessons() {
   const list = await api("/bookings"), mgr = me.role !== "teacher";
-  main.innerHTML = list.length ? list.map(b => `<div class="card"><b>${when(b.start)}</b><br>Ученик: ${esc(b.student)}
+  main.innerHTML = (mgr ? `<button class="btn" id="repeat">Создать регулярные уроки</button>` : "") + (list.length ? list.map(b => `<div class="card"><b>${when(b.start)} МСК</b>${!mgr && b.local_start ? `<br><span class="hint">Ваше время: ${esc(b.local_start)}</span>` : ""}<br>Ученик: ${esc(b.student)}
     ${mgr ? `<br>Преподаватель: ${esc(b.teacher)}` : ""}${b.note ? `<br><span class="hint">${esc(b.note)}</span>` : ""}
-    ${mgr ? `<div class="hint">${b.confirmed ? "Преподаватель подтвердил" : "Ждем подтверждения преподавателя"}</div>
+    ${mgr ? `<div class="hint">${b.confirmed ? "Преподаватель подтвердил" : "Ждём подтверждения преподавателя"}</div>
     <div class="row"><button class="btn" ${b.synced ? "disabled" : ""} data-a="sync" data-i="${b.id}">${b.synced ? "Внесено в langlisto" : "Внесено в langlisto?"}</button>
     <button class="btn2" data-a="move" data-i="${b.id}" data-t="${b.teacher_id}">Перенести</button>
     <button class="btn2" data-a="cancel" data-i="${b.id}">Отменить</button></div>` : ""}</div>`).join("")
-    : `<p class="hint">Ближайших уроков нет.</p>`;
+    : `<p class="hint">Ближайших уроков нет.</p>`);
+  if (mgr) $("#repeat").onclick = safe(() => recurringForm());
   main.querySelectorAll("[data-a]").forEach(b => b.onclick = safe(async () => {
     const id = b.dataset.i, a = b.dataset.a;
     if (a === "sync") { await api(`/bookings/${id}/synced`, "POST"); lessons(); }
     if (a === "move") move(id, +b.dataset.t);
     if (a === "cancel") tg.showConfirm("Отменить урок? Преподаватель получит уведомление.", safe(async yes => { if (yes) { await api(`/bookings/${id}/cancel`, "POST"); lessons(); } }));
   }));
+}
+
+async function recurringForm() {
+  const teachers = await api("/free?day=" + today());
+  ask(`<h3>Регулярные уроки</h3>
+    <label>Преподаватель</label><select id="rtid">${teachers.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join("")}</select>
+    <label>Ученик</label><input id="rstudent" placeholder="Имя ученика">
+    <label>Дни недели</label><div class="row">${WD.map((d,w)=>`<label style="display:flex;align-items:center;gap:4px;width:auto"><input type="checkbox" class="rwd" value="${w}" style="width:auto;margin:4px 0">${d}</label>`).join("")}</div>
+    <label>Время по Москве</label><select id="rhour">${opts(8,21,17)}</select>
+    <label>Первая дата</label><input type="date" id="rdate" value="${today()}" min="${today()}">
+    <label>Количество недель (до 16)</label><select id="rweeks">${[4,6,8,10,12,16].map(n=>`<option value="${n}"${n===8?" selected":""}>${n} недель</option>`).join("")}</select>
+    <label>Заметка</label><input id="rnote" placeholder="Необязательно">`, "Создать расписание", async () => {
+      const weekdays = [...dlg.querySelectorAll(".rwd:checked")].map(x=>+x.value);
+      if (!weekdays.length) return toast("Выберите хотя бы один день недели");
+      const result = await api("/recurring-bookings", "POST", {teacher_id:+$("#rtid").value, student:$("#rstudent").value.trim(), weekdays, hour:+$("#rhour").value, start_day:$("#rdate").value, weeks:+$("#rweeks").value, note:$("#rnote").value.trim()});
+      closeAsk();
+      toast(`Создано занятий: ${result.created.length}. Конфликтов: ${result.conflicts.length}.`);
+      lessons();
+    });
 }
 
 async function free(day = today()) {
